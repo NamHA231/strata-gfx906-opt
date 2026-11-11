@@ -1,0 +1,33 @@
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 6923f3510..6d40bb119 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -218,6 +218,7 @@ struct ggml_cuda_mmq_config {
+ #include "mmq-config-ampere.cuh"
+ #include "mmq-config-blackwell.cuh"
+ 
++#include "mmq-config-vega.cuh"
+ #include "mmq-config-gcn.cuh"
+ #include "mmq-config-cdna.cuh"
+ #include "mmq-config-rdna2.cuh"
+@@ -229,6 +230,9 @@ struct ggml_cuda_mmq_config {
+ 
+ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
+     if (GGML_CUDA_CC_IS_AMD(cc)) {
++        if (cc == GGML_CUDA_CC_VEGA20) {
++            return ggml_cuda_mmq_get_config_vega(type, J, fallback);
++        }
+         if (GGML_CUDA_CC_IS_GCN(cc)) {
+             return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+         }
+@@ -260,7 +264,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
+ 
+ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
+ #ifdef GGML_USE_HIP
+-#ifdef GCN
++#if defined(__gfx906__)
++    return ggml_cuda_mmq_get_config_vega(type, J, fallback);
++#elif defined(GCN)
+     return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+ #elif defined(CDNA)
+     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
