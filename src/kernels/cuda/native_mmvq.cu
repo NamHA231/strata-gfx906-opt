@@ -2365,10 +2365,12 @@ void launch_check() {
 // 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
-template<typename F, int NCOLS, int R>
+template<typename F, int NCOLS, int R, bool PAIR = false>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+                                        float* __restrict__ y, int n_in, int n_out,
+                                        const typename F::Block* __restrict__ w2 = nullptr,
+                                        float* __restrict__ y2 = nullptr) {
     constexpr int BPIW = 64 / F::T;
     static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
     const int lane = int(threadIdx.x) & 63;
@@ -2378,14 +2380,21 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
     const int x_stride = n_in / Q8K;
     const int kqs = F::kqs(lane);
     float tmp[NCOLS][R] = {};
+    float tmp2[NCOLS][R] = {};
     for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += BPIW) {
         const int kby = kbx * F::KBY;
 #pragma unroll
         for (int i = 0; i < R; ++i) {
             if (row0 + i < n_out) {
                 const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                typename F::W wv2;
+                if constexpr (PAIR) wv2 = F::load(w2 + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
 #pragma unroll
-                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                for (int j = 0; j < NCOLS; ++j) {
+                    const Q81Block* xj = x + std::size_t(j) * x_stride + kby;
+                    tmp[j][i] += F::apply(wv, xj, kqs);
+                    if constexpr (PAIR) tmp2[j][i] += F::apply(wv2, xj, kqs);
+                }
             }
         }
     }
@@ -2397,6 +2406,12 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
 #pragma unroll
             for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
+            if constexpr (PAIR) {
+                float v2 = tmp2[j][i];
+#pragma unroll
+                for (int off = 32; off > 0; off >>= 1) v2 += __shfl_xor(v2, off, 64);
+                if (lane == 0 && row0 + i < n_out) y2[std::size_t(j) * n_out + row0 + i] = v2;
+            }
         }
 }
 template<typename F, int NCOLS>
@@ -2405,7 +2420,16 @@ void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, 
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     constexpr int R = 1;
     const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
-    native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+    native_mmvq_wave_kernel<F, NCOLS, R, false><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+}
+template<typename F, int NCOLS>
+void wave_launch_pair_n(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out, cudaStream_t s) {
+    const auto* a = static_cast<const typename F::Block*>(w1);
+    const auto* b = static_cast<const typename F::Block*>(w2);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    constexpr int R = 1;
+    const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
+    native_mmvq_wave_kernel<F, NCOLS, R, true><<<blocks, 256, 0, s>>>(a, x, y1, n_in, n_out, b, y2);
 }
 template<typename F>
 void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -3472,10 +3496,38 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
+    if (ncols < 1 || ncols > 8 || n_out <= 0 || n_in <= 0 || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+        return false;
+#if defined(STRATA_HIP_GFX906) || defined(__HIPCC__)
+    if (!g_wave_off) {
+        const auto s = static_cast<cudaStream_t>(stream);
+        auto launch_pair_any = [&](auto traits_tag) {
+            using Traits = decltype(traits_tag);
+            switch (ncols) {
+                case 1: wave_launch_pair_n<Traits, 1>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 2: wave_launch_pair_n<Traits, 2>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 3: wave_launch_pair_n<Traits, 3>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 4: wave_launch_pair_n<Traits, 4>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 5: wave_launch_pair_n<Traits, 5>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 6: wave_launch_pair_n<Traits, 6>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 7: wave_launch_pair_n<Traits, 7>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                default: wave_launch_pair_n<Traits, 8>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+            }
+        };
+        switch (ggml_type) {
+            case 23: launch_pair_any(IQ4XSTraits{}); launch_check(); return true;
+            case 12: launch_pair_any(Q4KTraits{}); launch_check(); return true;
+            case 13: launch_pair_any(Q5KTraits{}); launch_check(); return true;
+            case 14: launch_pair_any(Q6KTraits{}); launch_check(); return true;
+            case 8:  launch_pair_any(SmallTraits<Q80Block, 8>{}); launch_check(); return true;
+            default: break;
+        }
+    }
+#endif
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
-    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
-        n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_in % 32 != 0 ||
+        n_in / F::DIV < F::BPI)
         return false;
     const auto& reg = q8_packed_registry();
     if (reg.count(w1) || reg.count(w2)) return false;

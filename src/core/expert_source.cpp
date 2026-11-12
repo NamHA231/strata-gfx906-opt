@@ -4862,25 +4862,6 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
-namespace {
-// STRATA_DRAFT_TAIL_SKIP: role-asymmetric tail skip rank for speculative draft tokens (t >= 1) in a verify window.
-// When unset, defaults to 2 whenever STRATA_ROUTE_TAIL_SKIP > 0 (or 0 if STRATA_DRAFT_TAIL_SKIP=0).
-std::atomic<int> g_draft_tail_skip_rank{-1};
-}  // namespace
-int draft_tail_skip_rank() {
-    int r = g_draft_tail_skip_rank.load(std::memory_order_relaxed);
-    if (r < 0) {
-        const char* v = std::getenv("STRATA_DRAFT_TAIL_SKIP");
-        if (v != nullptr && v[0] != '\0') {
-            r = std::clamp(std::atoi(v), 0, 10);
-        } else {
-            r = tail_skip_rank() > 0 ? 2 : 0;
-        }
-        g_draft_tail_skip_rank.store(r, std::memory_order_relaxed);
-    }
-    return r;
-}
-
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -4927,6 +4908,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
+    if (!d.usage.empty())
+        for (int64_t i = 0; i < n_tok * k; ++i)
+            if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
@@ -4954,30 +4938,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output) + STRATA_DRAFT_TAIL_SKIP=D (default 2 when R>0):
-        // Role-asymmetric tail skip: a missed expert is skipped unless at least one token routes it below its role-specific rank threshold
-        // (r < tail_rank for target token t == 0, or r < draft_tail_rank for speculative draft tokens t >= 1).
+        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
+        // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
+        // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
         const int tail_rank = tail_skip_rank();
-        const int draft_tail_rank = draft_tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if ((tail_rank > 0 || draft_tail_rank > 0) && d.peer == nullptr && d.remote_count == 0) {
-            bool keep_d[kMaxWindowEntries];
-            for (int q = 0; q < nd; ++q) keep_d[q] = false;
+        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+            int minr[kMaxWindowEntries];
+            for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
-                const int tok = (int) (i / k);
-                const int r = (int) (i % k);
-                const int thr = (tok == 0) ? (tail_rank > 0 ? tail_rank : 10)
-                                           : (draft_tail_rank > 0 ? draft_tail_rank : (tail_rank > 0 ? tail_rank : 10));
-                if (r < thr) {
-                    int q = 0;
-                    while (q < nd && distinct[q] != first_of[i]) ++q;
-                    if (q < nd) keep_d[q] = true;
-                }
+                int q = 0;
+                while (q < nd && distinct[q] != first_of[i]) ++q;
+                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || keep_d[q]) continue;
+                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
                 skip_d[q] = true;
                 --nmiss;
@@ -5064,29 +5041,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
-        if (!d.usage.empty()) {
-            const size_t base = (size_t) d.layers * (size_t) d.n_expert;
-            for (int64_t i = 0; i < n; ++i) {
-                const int32_t e = ids[i];
-                if (e < 0 || e >= d.n_expert || kind[i] == -2) continue;
-                const int tok = (int) (i / k);
-                const int r = (int) (i % k);
-                const bool is_res = d.host_res != nullptr && d.host_res[base + (size_t) e] >= 0;
-                const float w = is_res ? (tok == 0 ? 1.0f : 0.5f)
-                                       : ((tok == 0) ? (r < 3 ? 0.65f : (r == 3 ? 0.25f : 0.0f))
-                                                     : (r < 2 ? 0.20f : 0.0f));
-                if (w > 0.0f) d.usage[base + (size_t) e] += w;
-            }
-        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
-        if (!d.usage.empty())
-            for (int64_t i = 0; i < n_tok * k; ++i)
-                if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
@@ -5130,9 +5090,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
-        // Any token whose routed experts are all handled on GPU (0=VRAM, 1=PCIe, 2=peer/helper) or skipped (-2) needs no CPU activation quantisation.
+        // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
+        const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
         for (int64_t t = 0; t < n_tok; ++t) {
-            if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
+            if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)

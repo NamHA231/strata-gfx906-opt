@@ -18624,17 +18624,11 @@ int main(int argc, char** argv) {
                         // a probabilistic window must not condition the source on the draw: the policy copy fixed at the request's start
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
                         const bool probabilistic = use_mtp && !req_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
-                        const bool top2_bridge = strata::core::MtpDrafter::top2_lookup_env() && use_mtp && !req_df2 &&
-                                                 !probabilistic && draft_on && k > 0 && sfx_match >= 4 &&
-                                                 sbuf[0] != drafts[0] && sbuf[0] == mtp.top2(0);
-                        if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0] || top2_bridge)) {
+                        if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
                                 ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
-                            if ((pk.lookup || top2_bridge) && !trace_nopick) {
-                                T = top2_bridge ? std::min(3, k + 1) : pk.t;
-                                from_sfx = true;
-                            }
-                            if ((pk.lookup || top2_bridge) && !trace_nopick && o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
+                            if (pk.lookup && !trace_nopick) { T = pk.t; from_sfx = true; }
+                            if (pk.lookup && !trace_nopick && o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
                                 const int t = graph_fits(T);
                                 if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                                 T = t;
@@ -20414,9 +20408,6 @@ int main(int argc, char** argv) {
         std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        int64_t top2_rejected = 0, top2_hit = 0;
-        int64_t top2_bridge_windows = 0;
-        int64_t tree2_windows = 0;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
@@ -20597,17 +20588,10 @@ int main(int argc, char** argv) {
                 // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start chooses, and the
                 // lookup is taken without asking whether the MTP's first guess agrees
                 const bool probabilistic = use_mtp && !spec_uses_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
-                const bool top2_bridge = strata::core::MtpDrafter::top2_lookup_env() && use_mtp && !spec_uses_df2 &&
-                                         !probabilistic && draft_on && k > 0 && sfx_match >= 4 &&
-                                         sbuf[0] != drafts[0] && sbuf[0] == mtp.top2(0);
-                if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0] || top2_bridge)) {
+                if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
                     const strata::spec::DraftPolicy::Pick pk = probabilistic
                         ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
-                    if (pk.lookup || top2_bridge) {
-                        T = top2_bridge ? std::min(3, k + 1) : pk.t;
-                        from_sfx = true;
-                        top2_bridge_windows += top2_bridge;
-                    }
+                    if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
             }
@@ -20634,7 +20618,7 @@ int main(int argc, char** argv) {
                     chain_n = policy.chain(T, p_mtp, chain_n, cm);
                 }
             }
-            int T_mtp = T;
+            const int T_mtp = T;
             T += chain_n;
             const bool timed_round = !first_window;
             ++window_hist[(size_t) T];
@@ -20683,33 +20667,6 @@ int main(int argc, char** argv) {
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
             }
-            // gfx906 tree prototype: after a first-draft miss, verify the alternate child from the same
-            // uncommitted root. run() has only written speculative K/V; commit() below advances the chosen
-            // branch's GDN, indexer and PLE state. This second traversal is deliberately measured as a cost.
-            if (strata::core::MtpDrafter::tree2_env() && use_mtp && !mtp.prob() && !first_window &&
-                !from_sfx && chain_n == 0 && !gated_proposal && hashes == nullptr &&
-                o.spec_corrupt <= 0 && T >= 2 && outv[0] != window[1] && outv[0] == mtp.top2(0)) {
-                const int32_t target = outv[0];
-                --window_hist[(size_t) T];
-                T = T_mtp = 2;
-                ++window_hist[(size_t) T];
-                window[1] = target;
-                drive.d.layers = 0;
-                drive.d.experts = 0;
-                drive.d.failed = false;
-                if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err) || drive.d.failed) {
-                    std::fprintf(stderr, "strata generate: gfx906 tree alternate failed: %s\n", err.c_str());
-                    return 1;
-                }
-                if (outv[0] != target) {
-                    std::fprintf(stderr, "strata generate: gfx906 tree root changed between branches\n");
-                    return 1;
-                }
-                if (!follow.empty() && produced.size() + 1 < follow.size())
-                    std::fprintf(stderr, "strata tree2: emitted=%zu alternate_next=%d follow_next=%d\n",
-                                 produced.size(), (int) outv[1], (int) follow[produced.size() + 1]);
-                ++tree2_windows;
-            }
             if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
@@ -20731,10 +20688,6 @@ int main(int argc, char** argv) {
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
             const bool initial_round = first_window;   // a single-row window: no proposal to learn from
-            if (strata::core::MtpDrafter::top2_env() && !initial_round && !from_sfx && a < T - 1) {
-                ++top2_rejected;
-                if (mtp.top2(a) == outv[(size_t) a]) ++top2_hit;
-            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -20823,15 +20776,6 @@ int main(int argc, char** argv) {
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
-        if (strata::core::MtpDrafter::top2_env())
-            std::printf("%-24s %lld of %lld rejected MTP drafts matched the best alternative\n", "mtp top2",
-                        (long long) top2_hit, (long long) top2_rejected);
-        if (strata::core::MtpDrafter::top2_lookup_env())
-            std::printf("%-24s %lld windows used the runner-up to bridge into prompt lookup\n", "gfx906 top2 lookup",
-                        (long long) top2_bridge_windows);
-        if (strata::core::MtpDrafter::tree2_env())
-            std::printf("%-24s %lld alternate branches verified after a first-draft miss\n", "gfx906 tree2",
-                        (long long) tree2_windows);
         if (!follow.empty())
             std::printf("%-24s %lld of %lld emitted tokens differ from the argmax\n", "follow",
                         (long long) follow_differ, (long long) follow_emitted);

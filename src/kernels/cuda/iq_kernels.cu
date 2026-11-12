@@ -55,6 +55,17 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t s = v ^ p << 7;
     return s * 0x01010101;
 }
+__device__ __forceinline__ uint32_t unpack_ksigns_b8(const uint8_t v) {
+    const uint32_t p = __popc(v) & 1u;
+    return (uint32_t) v ^ (p << 7);
+}
+// Carry-free 4-byte two's-complement negation for positive codebook bytes g_i in [1, 127] (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S).
+// Replaces emulated __vcmpne4 + __vsub4 (~24 VALU ops) or double-dp4a with 5 VALU ops and a single dp4a on gfx906.
+__device__ __forceinline__ int nib_neg4(uint32_t g, uint32_t n) {
+    const uint32_t b = __umul24(n & 0xFu, 0x204081u) & 0x01010101u;
+    const uint32_t m = (b << 8) - b;
+    return (int) ((g ^ m) + b);
+}
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
 #if defined(STRATA_HIP_GFX906)
     // AMD: llama.cpp's HIP lookup (vecdotq.cuh) - v_perm_b32 takes 3-bit byte indices, so the low and high halves
@@ -117,6 +128,15 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+#if defined(STRATA_HIP_GFX906)
+        const uint32_t sb = unpack_ksigns_b8(aux32 >> (7 * k0 / 2));
+        const int grid0 = nib_neg4(grid_pos.x, sb);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
+        sumi0 = ggml_cuda_dp4a(grid0, u0, sumi0);
+        const int grid1 = nib_neg4(grid_pos.y, sb >> 4);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+        sumi1 = ggml_cuda_dp4a(grid1, u1, sumi1);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -126,6 +146,7 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
         const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi1 = ggml_cuda_dp4a(grid1, u1, sumi1);
+#endif
     }
     const int ls = aux32 >> 27 | 1;
     const int sumi = (sumi0 + sumi1) * ls / 8;
@@ -144,12 +165,18 @@ __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(const void* __restrict__ vb
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) iq2xs_grid)[q2[l0 / 2] & 0x1FF];
+#if defined(STRATA_HIP_GFX906)
+        const uint32_t sb = unpack_ksigns_b8(q2[l0 / 2] >> 9);
+        const int grid_l = nib_neg4(grid_pos.x, sb);
+        const int grid_h = nib_neg4(grid_pos.y, sb >> 4);
+#else
         const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         if (l0 < 4) {
             s00 = ggml_cuda_dp4a(grid_l, u0, s00);
@@ -179,10 +206,15 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+#if defined(STRATA_HIP_GFX906)
+        const int grid_l = nib_neg4((uint32_t) grid_pos[0], signs_packed_8[l0 / 2]);
+        const int grid_h = nib_neg4((uint32_t) grid_pos[1], signs_packed_8[l0 / 2] >> 4);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+#endif
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         if (l0 < 4) {
@@ -209,12 +241,18 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+#if defined(STRATA_HIP_GFX906)
+        const uint32_t sb = unpack_ksigns_b8(aux32 >> (7 * l0 / 2));
+        const int grid_l = nib_neg4((uint32_t) grid_pos.x, sb);
+        const int grid_h = nib_neg4((uint32_t) grid_pos.y, sb >> 4);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
         sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
@@ -240,10 +278,15 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
                                         iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+#if defined(STRATA_HIP_GFX906)
+        const int grid_l = nib_neg4((uint32_t) grid_pos.x, signs_packed_8[l0 / 2]);
+        const int grid_h = nib_neg4((uint32_t) grid_pos.y, signs_packed_8[l0 / 2] >> 4);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
@@ -945,11 +988,17 @@ template<> struct Split<16> {   // IQ2_XXS
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const uint2 grid_pos = grid_lut[aux8[k0 / 2]];
+#if defined(STRATA_HIP_GFX906)
+            const uint32_t sb = unpack_ksigns_b8(aux32 >> (7 * k0 / 2));
+            r.g[k0 + 0] = nib_neg4(grid_pos.x, sb);
+            r.g[k0 + 1] = nib_neg4(grid_pos.y, sb >> 4);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[k0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             r.g[k0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         r.ls = aux32 >> 27 | 1;
         r.dw = __half2float(bq2->d);
@@ -1038,11 +1087,17 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const uint2 grid_pos = grid_lut[q2[l0 / 2] & 0x1FF];
+#if defined(STRATA_HIP_GFX906)
+            const uint32_t sb = unpack_ksigns_b8(q2[l0 / 2] >> 9);
+            r.g[l0 + 0] = nib_neg4(grid_pos.x, sb);
+            r.g[l0 + 1] = nib_neg4(grid_pos.y, sb >> 4);
+#else
             const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         r.dw = __half2float(bq2->d);
         return r;
@@ -1067,10 +1122,15 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+#if defined(STRATA_HIP_GFX906)
+            r.g[l0 + 0] = nib_neg4((uint32_t) grid_pos[0], signs_packed_8[l0 / 2]);
+            r.g[l0 + 1] = nib_neg4((uint32_t) grid_pos[1], signs_packed_8[l0 / 2] >> 4);
+#else
             const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
             r.g[l0 + 0] = __vsub4(grid_pos[0] ^ signs0, signs0);
             r.g[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
+#endif
         }
         r.dw = __half2float(bq2->d);
         return r;
@@ -1098,11 +1158,17 @@ template<> struct Split<18> {   // IQ3_XXS
                 r.g[l0 + 0] = (int) ((grid_pos.x ^ ml) + (ml & 0x01010101u));
                 r.g[l0 + 1] = (int) ((grid_pos.y ^ mh) + (mh & 0x01010101u));
             } else {
+#if defined(STRATA_HIP_GFX906)
+                const uint32_t sb = unpack_ksigns_b8(aux32 >> (7 * l0 / 2));
+                r.g[l0 + 0] = nib_neg4((uint32_t) grid_pos.x, sb);
+                r.g[l0 + 1] = nib_neg4((uint32_t) grid_pos.y, sb >> 4);
+#else
                 const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
                 const int signs0 = __vcmpne4(signs & 0x08040201, 0);
                 r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
                 const int signs1 = __vcmpne4(signs & 0x80402010, 0);
                 r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
             }
         }
         r.ls = aux32 >> 28;
@@ -1163,10 +1229,15 @@ template<> struct Split<21> {   // IQ3_S
                 r.g[l0 + 0] = (int) (((uint32_t) grid_pos.x ^ ml) + (ml & 0x01010101u));
                 r.g[l0 + 1] = (int) (((uint32_t) grid_pos.y ^ mh) + (mh & 0x01010101u));
             } else {
+#if defined(STRATA_HIP_GFX906)
+                r.g[l0 + 0] = nib_neg4((uint32_t) grid_pos.x, signs_packed_8[l0 / 2]);
+                r.g[l0 + 1] = nib_neg4((uint32_t) grid_pos.y, signs_packed_8[l0 / 2] >> 4);
+#else
                 const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
                 const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
                 r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
                 r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
             }
         }
         r.ls = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
@@ -2536,6 +2607,15 @@ template<> struct EdGrid<21> { static constexpr int words = 1024;
         for (int i = tid; i < 512; i += 256) s[i] = iq3s_grid[i];
         stage_iq3s_masks(s, tid, 256);
     } };
+// EdGrid with a no-grid entry for IQ4_XS (the fused gate/up kernel's staging)
+template<int TG> struct EdGridWords {
+    static constexpr int value = EdGrid<TG>::words;
+    __device__ static void copy(uint32_t* s, int tid) { EdGrid<TG>::copy(s, tid); }
+};
+template<> struct EdGridWords<23> {
+    static constexpr int value = 4;
+    __device__ static void copy(uint32_t*, int) {}
+};
 
 // One entry's q8_1 row (XB blocks of 36 bytes, 4-byte aligned) into shared memory as entry c: the 8 words of block k
 // in planes (HALVES: s_u[(2 c + h) XB + k] = words 4h..4h+3, two 16-byte loads per call, conflict-free over 16
@@ -3479,7 +3559,13 @@ bool g_stage_grid = [] {
 // expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
 bool g_stage_grid_mmvq = g_stage_grid && [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID_MMVQ");
+#if defined(STRATA_HIP_GFX906)
+    // gfx906-opt: on by default on MI50 (the IQ3_S shared-expert / dense mmvq reads its codebook from LDS);
+    // STRATA_IQ_STAGE_GRID_MMVQ=0 turns it off
+    return !(v != nullptr && v[0] == '0');
+#else
     return v != nullptr && v[0] == '1';
+#endif
 }();
 // IQ3_XXS's and IQ3_S's codebooks and sign-mask tables staged in shared memory by the grouped expert kernels (the
 // single-matrix mmvq does not): bitwise the same either way.  OPT-IN: STRATA_IQ_STAGE_TABLES=1.  The PR (#1424) made it

@@ -102,21 +102,15 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
                                       float4* __restrict__ output4, int64_t n4) {
     const int64_t tk = blockIdx.y;
     __shared__ int hit_mask;
-    __shared__ int skip_mask;
-    if (threadIdx.x == 0) { hit_mask = 0; skip_mask = 0; }
+    if (threadIdx.x == 0) hit_mask = 0;
     __syncthreads();
     const int nh = *count;
     for (int h = threadIdx.x; h < nh; h += blockDim.x) {
-        const int raw = dst[h];
-        const int r = raw < 0 ? (-raw - 1) : raw;
-        if (r / 10 == (int) tk) {
-            if (raw < 0) atomicOr(&skip_mask, 1 << (r % 10));
-            else atomicOr(&hit_mask, 1 << (r % 10));
-        }
+        const int r = dst[h];
+        if (r / 10 == (int) tk) atomicOr(&hit_mask, 1 << (r % 10));
     }
     __syncthreads();
     const int mask = hit_mask;
-    const int smask = skip_mask;
     parts4 += tk * 10 * n4;
     hits4 += tk * 10 * n4;
     weights += tk * 10;
@@ -125,13 +119,14 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
     const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (c4 >= n4) return;
     const float w0 = __ldg(weights + 0);
-    float4 p0 = (mask & 1) ? hits4[c4] : ((smask & 1) ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : parts4[c4]);
+    float4 p0 = parts4[c4];
+    if (mask & 1) { const float4 hh = hits4[c4]; p0.x += hh.x; p0.y += hh.y; p0.z += hh.z; p0.w += hh.w; }
     float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
 #pragma unroll
     for (int expert = 1; expert < 10; ++expert) {
         const float w = __ldg(weights + expert);
-        float4 p = ((mask >> expert) & 1) ? hits4[int64_t(expert) * n4 + c4]
-                 : (((smask >> expert) & 1) ? make_float4(0.0f, 0.0f, 0.0f, 0.0f) : parts4[int64_t(expert) * n4 + c4]);
+        float4 p = parts4[int64_t(expert) * n4 + c4];
+        if ((mask >> expert) & 1) { const float4 hh = hits4[int64_t(expert) * n4 + c4]; p.x += hh.x; p.y += hh.y; p.z += hh.z; p.w += hh.w; }
         sum.x = fmaf(p.x, w, sum.x);
         sum.y = fmaf(p.y, w, sum.y);
         sum.z = fmaf(p.z, w, sum.z);

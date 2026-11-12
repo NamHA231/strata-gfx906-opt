@@ -59,16 +59,7 @@ inline int choose_window(const WindowRuleIn& in) {
         T = std::clamp(in.chain_rows, 1, in.cap);
     } else if (in.draft_on && in.spec_min_p > 0.0 && in.dprob != nullptr) {
         T = 1;
-        float p_joint = 1.0f;
-        const float mp = (float) in.spec_min_p;
-        while (T < in.cap) {
-            const float p = in.dprob[T - 1];
-            p_joint *= p;
-            const float min_step = (T == 1) ? mp : (T == 2) ? std::max(mp, 0.14f) : std::max(mp, 0.50f);
-            const float min_joint = (T == 1) ? mp : (T == 2) ? std::max(mp, 0.12f) : 0.42f;
-            if (p < min_step || p_joint < min_joint) break;
-            ++T;
-        }
+        while (T < in.cap && in.dprob[T - 1] >= (float) in.spec_min_p) ++T;
     }
     if (in.df2_active && in.draft_conf > 0.0 && in.dprob != nullptr) {   // DFlash2's own confidence: every draft so far holds
         T = 1;

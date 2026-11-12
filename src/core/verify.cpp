@@ -118,7 +118,7 @@ struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
 struct RouteResidentCfg {
     float margin = 0.0f;
-    int lo = 3, hi = 9;
+    int lo = 6, hi = 9;
     // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
     // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
     // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
@@ -2402,27 +2402,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
-            static const bool pcie_share_off = [] {
-                if (const char* v = std::getenv("STRATA_NO_PCIE_SHARE")) return v[0] != '0';
-                if (const char* v = std::getenv("STRATA_PCIE_FRAC_DEFAULT")) return std::strcmp(v, "old") == 0;
-                return false;
-            }();
-            if (!pcie_share_off || m_bal_ != nullptr || device_plan_) {
-                if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-                else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
-                    wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
-                else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-                if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-                    uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-                }
-                stamp(l, 21, grp);
-                // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
-                // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-                grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
+            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+            else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
+                wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
+            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
             }
+            stamp(l, 21, grp);
+            // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
+            // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -2449,7 +2442,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n >= 1 &&
+            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
             strata::dispatch::notef("experts layer: cpu rows via %ld (1 = fused wait+copy, 0 = wait then copy), hits in combine=%ld", (long) (fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr), (long) hits_in_combine);

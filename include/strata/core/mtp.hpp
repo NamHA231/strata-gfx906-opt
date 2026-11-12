@@ -76,10 +76,6 @@ public:
     bool draft_head_view(const NativeHead* head, const std::string& vocab_path, DraftHeadView& out) const;
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
-    /// gfx906 experiment: allow prompt lookup to bridge through the runner-up of the first MTP draft.
-    static bool top2_lookup_env();
-    /// gfx906 two-branch verifier experiment; records the first draft's alternate token.
-    static bool tree2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }

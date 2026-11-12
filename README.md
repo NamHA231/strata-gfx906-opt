@@ -16,22 +16,19 @@ This fork resolves the severe decode bottlenecks and speculative MoE thrashing i
 
 ## 🚀 Key Highlights & Breakthroughs
 
-1. **CRA-ZSV v3.1 (Co-Routed Asymmetric Zero-Stall Verify):**
-   - Implements role-asymmetric MoE routing: strict top-3 preservation for target tokens ($t=0$) combined with **Co-Routed Speculative Coalescing (CRSC)** and **Zero-Stall VRAM Residency** for draft tokens ($t \ge 1$).
-   - Eliminates 85% of CPU DDR4 expert miss stalls and 80% of PCIe DMA swap operations, maintaining a **99.5%–99.8% VRAM hit rate** even at 40K context.
-2. **Zero PCIe-Share Launch Overhead:**
-   - Prunes **240 redundant PCIe-share kernel launches** (over 144,000 empty GPU threadblocks) per verify window in `verify.cpp`.
-   - Fuses doorbell wait synchronization (`STRATA_FUSE_WAIT=1`) and expert accumulation (`STRATA_FUSE_HITS=1`), saving ~6–7 ms of GPU-reach wait time every window.
-3. **Sliding-Window MTP Drafter (`--mtp-window 4096`):**
-   - Constrains dense attention KV scanning in the speculative MTP Drafter to a sliding 4,096-token window.
-   - Slashes draft time at 40K context from **5.24 ms down to 3.14 ms/window** with zero degradation in draft acceptance accuracy.
-4. **Dynamic Joint-Confidence Speculation ($T = 1..4$):**
-   - Dynamically expands the speculation window using cumulative joint probability:
-     $$P_{\text{joint}}(j) = \prod_{i=0}^j p_i$$
-   - Maximizes throughput (up to 4 tokens per window) during confident reasoning/coding segments while avoiding speculation stalls during ambiguous tokens.
+1. **Bit-Exact Carry-Free `nib_neg4` ISA Kernel:**
+   - Implements carry-free two's-complement negation for positive codebook bytes on AMD GCN 5.1 (`gfx906`), replacing ~24 emulated `__vcmpne4` + `__vsub4` VALU instructions with a single 24-bit multiply `__umul24(n, 0x204081u)` + bit logic (only 5 VALU ops + `v_dot4_i32_i8`).
+   - Achieves 100% bit-exact parity across `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, and `IQ3_S`.
+2. **Wave64 Paired Native MMVQ:**
+   - Optimized for 64-wide wavefronts with a full 64-lane cross-wave reduction (`__shfl_xor(v, off, 64)`).
+   - Computes dual matrix weights in a single pass over activation blocks (`PAIR=true`), cutting activation fetch pressure on HBM2 in half.
+3. **LDS Grid Staging MMVQ:**
+   - Stages `iq3s_grid` codebooks and bit masks into Local Data Share (LDS), eliminating cache bank conflicts during expert MMVQ decode.
+4. **Sliding-Window MTP Drafter (`--mtp-window 4096`):**
+   - Constrains dense attention KV scanning in the speculative MTP Drafter to a sliding 4,096-token window, slashing draft time at long context with zero degradation in draft accuracy.
 5. **Full Wave64 Alignment & NaN Fixes:**
    - Rectifies CUDA 32-lane warp assumptions (`STRATA_GDN_CONVL2=0`, `STRATA_GDN_TC=0`), eliminating the catastrophic `non-finite logits (#879)` crash at long context lengths.
-   - Tailored for the 64-wide wavefronts of AMD Vega 20 (`gfx906`).
+   - Tailored specifically for the 64-wide wavefronts of AMD Vega 20 (`gfx906`).
 
 ---
 

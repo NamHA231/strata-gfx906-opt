@@ -558,26 +558,8 @@ bool MtpDrafter::top2_env() {
     return on;
 }
 
-bool MtpDrafter::top2_lookup_env() {
-#if defined(STRATA_HIP_GFX906)
-    static const bool on = [] { const char* v = std::getenv("STRATA_GFX906_TOP2_LOOKUP"); return v && v[0] == '1'; }();
-    return on;
-#else
-    return false;
-#endif
-}
-
-bool MtpDrafter::tree2_env() {
-#if defined(STRATA_HIP_GFX906)
-    static const bool on = [] { const char* v = std::getenv("STRATA_GFX906_TREE2"); return v && v[0] == '1'; }();
-    return on;
-#else
-    return false;
-#endif
-}
-
-// STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): the best alternative to draft j under the draft layer.
-// Read the head before the next step overwrites it. Slow; never used to choose a production token.
+// STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
+// the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
 void MtpDrafter::record_top2(int j) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
@@ -587,12 +569,11 @@ void MtpDrafter::record_top2(int j) {
         top2_[(size_t) j] = -1;
         return;
     }
-    const int32_t chosen = ((volatile int32_t*) h_out_)[j];
-    int64_t b2 = -1;
+    int64_t b1 = -1, b2 = -1;
     for (int64_t i = 0; i < nv; ++i) {
         const float v = lg_host_[(size_t) i];
-        const int32_t token = dhead_ != nullptr ? dvocab_host_[(size_t) i] : (int32_t) i;
-        if (token != chosen && std::isfinite(v) && (b2 < 0 || v > lg_host_[(size_t) b2])) b2 = i;
+        if (b1 < 0 || v > lg_host_[(size_t) b1]) { b2 = b1; b1 = i; }
+        else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
     }
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
 }
@@ -1740,7 +1721,6 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
-    if (top2_env() || top2_lookup_env() || tree2_env()) top2_.assign((size_t) max_t_, -1);
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
@@ -1857,24 +1837,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (dt) g_dt.wait0_ms += hms(tl);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pj = ((volatile float*) h_prob_)[0];
-        if (probs) {
-            probs[0] = pj;
-            for (int z = 1; z < max_steps; ++z) probs[z] = 0.0f;
-        }
-        if (top2_env() || top2_lookup_env() || tree2_env()) {
-            if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: top2 diagnostic sync failed"; return false; }
-            record_top2(0);
-        }
+        if (probs) probs[0] = pj;
         n = 1;
-        float p_joint = pj;
-        auto step_gate = [&](int j_step) -> bool {
-            if (chain_rule_) return chain_rule_(j_step - 1, pj);
-            if (min_p <= 0.0f) return true;
-            if (j_step == 1) return pj >= std::max(min_p, 0.16f);
-            if (j_step == 2) return pj >= std::max(min_p, 0.62f) && p_joint >= 0.52f;
-            return pj >= std::max(min_p, 0.75f) && p_joint >= 0.65f;
-        };
-        for (int j = 1; j < max_steps && step_gate(j); ++j) {
+        for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : pj >= min_p); ++j) {
             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
             tl = Clock::now();
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
@@ -1890,12 +1855,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (dt) g_dt.waitj_ms += hms(tl);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
-            p_joint *= pj;
             if (probs) probs[j] = pj;
-            if (top2_env()) {
-                if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: top2 diagnostic sync failed"; return false; }
-                record_top2(j);
-            }
             ++n;
         }
         if (chain_rule_ && n >= max_steps) (void) chain_rule_(n - 1, pj);   // the last step of a full chain

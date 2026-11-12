@@ -737,14 +737,7 @@ __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restri
                                 const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
     const int h = blockIdx.y;
     if (h >= *count) return;
-    const int raw = dst[h];
-    if (raw < 0) {
-        const size_t row = (size_t) (-raw - 1) * (size_t) n_embd;
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
-            parts[row + i] = 0.0f;
-        return;
-    }
-    const size_t row = (size_t) raw * (size_t) n_embd;
+    const size_t row = (size_t) dst[h] * (size_t) n_embd;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_embd; i += gridDim.x * blockDim.x)
         parts[row + i] += hit_out[row + i];
 }
