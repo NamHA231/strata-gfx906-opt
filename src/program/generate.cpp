@@ -4295,7 +4295,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
         ld.metal_build = true;   // (Metal's windows hold 8 rows and it has no 12-row window: "metal window: window size out of range")
 #endif
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
         ld.hip_build = true;     // CMakeLists: 12 on the 8-row CUDA serve, off on Metal, HIP and every other case
 #endif
         o.lookup_max_t = strata::core::default_lookup_max_t(ld);
