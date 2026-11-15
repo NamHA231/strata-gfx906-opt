@@ -5,12 +5,13 @@
   <img src="https://img.shields.io/badge/Target_GPU-Instinct_MI50_32GB_HBM2-blue?style=for-the-badge&logo=amd" alt="AMD MI50">
   <img src="https://img.shields.io/badge/ROCm-6.3.3_(HIP)-purple?style=for-the-badge" alt="ROCm 6.3.3">
   <img src="https://img.shields.io/badge/Decode_Speed-39_--_45+_tok/s-success?style=for-the-badge" alt="Decode Speed">
+  <img src="https://img.shields.io/badge/Prefill_Speed-Up_to_565+_tok/s-success?style=for-the-badge" alt="Prefill Speed">
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT License">
 </p>
 
 An ultra-optimized fork of the **Strata Engine** engineered specifically for the **AMD Radeon Instinct MI50 (32GB HBM2, `gfx906` / Vega 20)** running **ROCm 6.3.3 / HIP**. 
 
-This fork resolves the severe decode bottlenecks and speculative MoE thrashing in standard Strata, accelerating large MoE models (such as `Qwen3.8-Flash-Next` 27B / 3.8B active) from **26–32 tok/s** to **39–45+ tok/s** across short, medium, and extreme long-context (40K+ tokens) workloads.
+This fork resolves the severe decode and prefill bottlenecks in standard Strata, accelerating large MoE models (such as `Qwen3.8-Flash-Next` 27B / 3.8B active) from **26–32 tok/s** to **39–45+ tok/s** in decode and up to **565.4 tok/s** in long-prompt prefill (`+52.4%` at ~4K tokens).
 
 ---
 
@@ -27,12 +28,28 @@ This fork resolves the severe decode bottlenecks and speculative MoE thrashing i
 4. **Sliding-Window MTP Drafter (`--mtp-window 4096`):**
    - Constrains dense attention KV scanning in the speculative MTP Drafter to a sliding 4,096-token window, slashing draft time at long context with zero degradation in draft accuracy.
 5. **Full Wave64 Alignment & NaN Fixes:**
-   - Rectifies CUDA 32-lane warp assumptions (`STRATA_GDN_CONVL2=0`, `STRATA_GDN_TC=0`), eliminating the catastrophic `non-finite logits (#879)` crash at long context lengths.
+   - Rectifies CUDA 32-lane warp assumptions (`STRATA_GDN_CONVL2`, `STRATA_GDN_TC`), eliminating the catastrophic `non-finite logits (#879)` crash at long context lengths.
    - Tailored specifically for the 64-wide wavefronts of AMD Vega 20 (`gfx906`).
+6. **MI50 Prefill Breakthroughs (Up to 565.4 tok/s at ~4K tokens):**
+   - **Dense GEMMs (`FP16` + `rocBLAS`):** Links `roc::rocblas` with a dedicated 154-shape MI50 `f16o_c32` tuning table ([`tools/hip/gfx906-rocblas-4.3.0.8ebd6c11.txt`](tools/hip/gfx906-rocblas-4.3.0.8ebd6c11.txt)).
+   - **Flash-QSA Zero-Spill (`qsa_flash_gfx906_kernel`):** LDS-staged `Q` + warp-DPP reduction (`dpp_xor<1,2>`) with zero VGPR spills and fused `gate_attn` epilogue (`1.27x–1.31x` standalone).
+   - **Zero-Spill MoE `native_w11_kernel` (`IQ3_XXS`):** 4-row A blocking eliminates all `108 B/lane` scratch spills (`256 -> 245..246` VGPRs, `0 B` spill, `1.34x` vs MMQ at `928` tokens).
+   - **GDN Recurrence & Conv Fast Path:** Validates and enables `STRATA_GDN_HEAD=1`, `STRATA_GDN_PP=2`, `STRATA_GDN_NOY=1`, `STRATA_GDN_CONVL2=2` (`0` failures in `gdn_parity`).
 
 ---
 
 ## 📊 Benchmark Results
+
+### Live End-to-End Prefill Speed (`Qwen3.8-Flash-Next-Coder-IQ3_XXS`, `cache_n = 0`)
+
+| Prompt Length (Before -> After) | Baseline (`tok/s`) | Optimized (`tok/s`) | Gain |
+| :--- | :---: | :---: | :---: |
+| Short (`106 -> 118` tok) | `67.2 tok/s` | **`86.5 tok/s`** | **+28.7%** |
+| Small (`291 -> 272` tok) | `133.2 tok/s` | **`148.5 tok/s`** | **+11.5%** |
+| Medium (`932 -> 895` tok) | `246.0 tok/s` | **`296.4 tok/s`** | **+20.5%** |
+| Long (`3928 -> 3997` tok) | `371.0 tok/s` | **`565.4 tok/s`** | **+52.4% (`1.52x`)** |
+
+### Live Decode Speed (`max_tokens = 1200`)
 
 Measured on **AMD Radeon Instinct MI50 32GB HBM2** + **AMD Ryzen 5 5600G** + **64GB DDR4-3200** via OpenAI-compatible API (`/v1/chat/completions`) using `Qwen3.8-Flash-Next-Coder-IQ3_XXS` (`max_tokens = 1200`):
 
@@ -44,7 +61,7 @@ Measured on **AMD Radeon Instinct MI50 32GB HBM2** + **AMD Ryzen 5 5600G** + **6
 | **`Strata-gfx906-opt` (Multi-Turn 11K)** | `10,511 → 11,217` tok | Thinking (`688` tok)<br>Writing (`494` tok) | **`39.3 tok/s`**<br>**`43.2 tok/s`** | **`40.9 tok/s`** | **`58.3%`** (`2.21` tok/w)<br>**`66.0%`** (`2.63` tok/w) | **`99.6%`**<br>**`99.1%`** |
 | **`Strata-gfx906-opt` (Extreme Long 39.5K)** | `38,850 → 39,556` tok | Thinking (`689` tok)<br>Writing (`494` tok) | **`38.8 tok/s`**<br>**`45.6 tok/s`** | **`41.4 tok/s`** | **`59.6%`** (`2.14` tok/w)<br>**`73.0%`** (`2.84` tok/w) | **`99.8%`**<br>**`99.3%`** |
 
-> Detailed technical logs, regression formulas, and step-by-step diagnosis are documented in [`docs/GFX906_COMPLETE_OPTIMIZATION_REPORT.md`](docs/GFX906_COMPLETE_OPTIMIZATION_REPORT.md).
+> Detailed technical logs, regression formulas, and step-by-step diagnosis are documented in [`docs/GFX906_COMPLETE_OPTIMIZATION_REPORT.md`](docs/GFX906_COMPLETE_OPTIMIZATION_REPORT.md) and [`docs/GFX906_PREFILL_OPTIMIZATION_REPORT.md`](docs/GFX906_PREFILL_OPTIMIZATION_REPORT.md).
 
 ---
 
@@ -94,6 +111,11 @@ Here is the production configuration for running `Qwen3.8-Flash-Next-Coder-IQ3_X
     "STRATA_COMMIT_SYNC": "1",
     "STRATA_EXP_MODE": "8",
     "STRATA_PF_FUSED": "1",
+    "STRATA_MMQ_DIRECT": "1",
+    "STRATA_MMQ_GROUP_SORT": "1",
+    "STRATA_PF_TAIL_SKIP": "7",
+    "STRATA_HIP_PROMPT_F16": "1",
+    "STRATA_ROCBLAS_TUNING": "/path/to/strata-gfx906-opt/tools/hip/gfx906-rocblas-4.3.0.8ebd6c11.txt",
     "STRATA_HIP_SWIGLU_FUSED": "1",
     "STRATA_HIP_ROUTER_FAST": "1",
     "STRATA_GFX906_ATTN_QUERY_SWIZZLE": "0",
@@ -103,7 +125,10 @@ Here is the production configuration for running `Qwen3.8-Flash-Next-Coder-IQ3_X
     "STRATA_LOOKUP_MAX_T": "0",
     "STRATA_NV_CHUNK": "0",
     "STRATA_GDN_TC": "0",
-    "STRATA_GDN_CONVL2": "0",
+    "STRATA_GDN_HEAD": "1",
+    "STRATA_GDN_PP": "2",
+    "STRATA_GDN_NOY": "1",
+    "STRATA_GDN_CONVL2": "2",
     "STRATA_ENGINE_NICE": "0",
     "STRATA_PCIE_FRAC_DEFAULT": "old",
     "STRATA_OLD_Q80_SCALED": "1",
@@ -147,6 +172,7 @@ python3 -m serve.server --engine strata --config config.json --host 0.0.0.0 --po
 
 ## 📖 In-Depth Documentation
 
+- 🚀 [**Prefill Optimization Report (Vietnamese)**](docs/GFX906_PREFILL_OPTIMIZATION_REPORT.md): MI50 `rocBLAS` FP16 tuning, zero-spill Flash-QSA, `native_w11_kernel` spill elimination, and GDN fast paths.
 - 📑 [**Complete Optimization Report (Vietnamese)**](docs/GFX906_COMPLETE_OPTIMIZATION_REPORT.md): Full narrative from initial bug diagnosis, mathematical modeling, kernel design, to verified benchmarks.
 - 🔬 [**Decode Speed Diagnosis & Log Regression**](docs/GFX906_DECODE_SPEED_DIAGNOSIS_0211.md): Technical breakdown of the 398,999 verify rounds from real Hermes traffic.
 - ⚡ [**Single MI50 Tuning Guide**](docs/GFX906_SINGLE_MI50_IQ3_S.md): VRAM cache sizing, PCIe bandwidth tuning, and pack preparation.

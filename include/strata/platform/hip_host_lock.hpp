@@ -48,6 +48,7 @@ inline bool on() {
 // page.  The engine's registrations are page-aligned allocations, so there is no such pair today.
 inline void lock(const void* p, size_t n) {
     if (!on() || p == nullptr || n == 0) return;
+    if (n >= (2ull << 20)) (void) ::madvise(const_cast<void*>(p), n, MADV_HUGEPAGE);
     State& s = st();
     std::lock_guard<std::mutex> g(s.mu);
     if (::mlock(p, n) == 0) {
@@ -58,13 +59,32 @@ inline void lock(const void* p, size_t n) {
             std::fprintf(stderr, "strata: HIP: host memory mapped for the GPU is mlock'd as well (ROCm does not pin it; "
                                  "STRATA_HIP_MLOCK=0 turns this off; VmLck in /proc/self/status shows what is locked)\n");
         }
-    } else if (!s.warned) {
+        return;
+    }
+    const int e = errno;
+    size_t locked = 0;
+    for (size_t step : {size_t(64ull << 20), size_t(4ull << 20)}) {
+        while (locked + step <= n) {
+            if (::mlock(static_cast<const uint8_t*>(p) + locked, step) != 0) break;
+            locked += step;
+        }
+    }
+    if (locked > 0) {
+        s.ranges[p] = locked;
+        s.asked += locked;
+    }
+    if (!s.warned) {
         s.warned = true;
-        const int e = errno;
-        std::fprintf(stderr, "strata: HIP: mlock of %.1f MiB of host memory mapped for the GPU was refused (%s): it stays "
-                             "pageable and memory pressure can stall the GPU - raise the memlock limit (ulimit -l "
-                             "unlimited, LimitMEMLOCK=infinity, docker --ulimit memlock=-1)\n",
-                     (double) n / 1048576.0, std::strerror(e));
+        if (locked > 0) {
+            std::fprintf(stderr, "strata: HIP: full mlock of %.1f MiB exceeded RLIMIT_MEMLOCK (%s); locked hottest prefix "
+                                 "%.1f MiB + MADV_HUGEPAGE on all %.1f MiB\n",
+                         (double) n / 1048576.0, std::strerror(e), (double) locked / 1048576.0, (double) n / 1048576.0);
+        } else {
+            std::fprintf(stderr, "strata: HIP: mlock of %.1f MiB of host memory mapped for the GPU was refused (%s): it stays "
+                                 "pageable and memory pressure can stall the GPU - raise the memlock limit (ulimit -l "
+                                 "unlimited, LimitMEMLOCK=infinity, docker --ulimit memlock=-1)\n",
+                         (double) n / 1048576.0, std::strerror(e));
+        }
     }
 }
 inline void unlock(const void* p) {

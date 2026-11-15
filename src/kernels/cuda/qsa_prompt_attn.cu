@@ -2452,10 +2452,276 @@ bool qsa_prompt_attn_matrix_cores_gfx12() {
 
 bool qsa_hip_wmma_active() { return qsa_prompt_attn_matrix_cores_requested(); }
 
+#if defined(__HIPCC__) && defined(STRATA_HIP_GFX906)
+template <int M>
+__device__ __forceinline__ float gfx906_dpp_xor(float v) {
+    if constexpr (M == 1) {
+        return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xF, 0xF, false));
+    } else if constexpr (M == 2) {
+        return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x4E, 0xF, 0xF, false));
+    } else {
+        return __shfl_xor(v, M, 64);
+    }
+}
+
+template <bool GATE>
+__global__ void __launch_bounds__(256, 2)
+qsa_flash_gfx906_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+                        const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale_log2,
+                        float* __restrict__ attn, int cap,
+                        const float* __restrict__ qf, uint16_t* __restrict__ o16, int64_t ld16) {
+    const int q_idx = (int) blockIdx.x;
+    const int kvh = (int) blockIdx.y;
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 63;
+    const int warp = tid >> 6; // 0..3
+    const int sg = lane >> 4;  // 0..3
+
+    const int width = min(cap, max(0, steps[(size_t) q_idx * kStepCount + kStepWidth]));
+    const int32_t* idq = ids + (size_t) q_idx * cap;
+    const float* q_base = q + ((size_t) (q_idx * n_kv_heads + kvh) * G) * HD;
+
+    union SharedMem {
+        struct {
+            long long srow[64];
+            float sm[4][G];
+            float sl[4][G];
+            float4 sq[G][64]; // 12 KB
+        } loop;
+        struct {
+            long long srow[64];
+            float sm[4][G];
+            float sl[4][G];
+            float4 sacc[4][3][64]; // 12 KB
+        } merge;
+    };
+    __shared__ __align__(16) SharedMem S;
+
+    for (int i = tid; i < G * 64; i += 256) {
+        const int h = i >> 6, l = i & 63;
+        S.loop.sq[h][l] = *reinterpret_cast<const float4*>(q_base + (size_t) h * HD + 4 * l);
+    }
+
+    float4 acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    float m_cur = -1e30f;
+    float l_cur = 0.0f;
+    const int h_lane = lane & 15;
+    const int c_lane = (lane >> 5) & 1;
+
+    for (int c_blk = 0; c_blk < width; c_blk += 64) {
+        if (tid < 64) {
+            const int ci = c_blk + tid;
+            long long r = -1;
+            if (ci < width) {
+                const int cell = idq[ci];
+                if (cell >= 0) {
+                    const long long pg = (long long) p.page_table[cell / page_size];
+                    if (pg >= 0) r = (pg * n_kv_heads + kvh) * page_size + (cell % page_size);
+                }
+            }
+            S.loop.srow[tid] = r;
+        }
+        __syncthreads();
+
+        const int n_blk = min(64, width - c_blk);
+        const int w_start = warp * 16;
+        for (int cw = 0; cw < 16 && (w_start + cw) < n_blk; cw += 2) {
+            const int base = w_start + cw;
+            const long long r0 = S.loop.srow[base + 0];
+            const long long r1 = (base + 1 < n_blk) ? S.loop.srow[base + 1] : -1;
+
+            uint32_t k0 = 0, k1 = 0, v0 = 0, v1 = 0;
+            float ks0 = 0.0f, ks1 = 0.0f, vs0 = 0.0f, vs1 = 0.0f;
+            if (r0 >= 0) {
+                k0 = *reinterpret_cast<const uint32_t*>(p.k_q + r0 * HD + 4 * lane);
+                v0 = *reinterpret_cast<const uint32_t*>(p.v_q + r0 * HD + 4 * lane);
+                ks0 = __half2float(__ushort_as_half(p.k_scale[r0 * 4 + sg]));
+                vs0 = __half2float(__ushort_as_half(p.v_scale[r0 * 4 + sg]));
+            }
+            if (r1 >= 0) {
+                k1 = *reinterpret_cast<const uint32_t*>(p.k_q + r1 * HD + 4 * lane);
+                v1 = *reinterpret_cast<const uint32_t*>(p.v_q + r1 * HD + 4 * lane);
+                ks1 = __half2float(__ushort_as_half(p.k_scale[r1 * 4 + sg]));
+                vs1 = __half2float(__ushort_as_half(p.v_scale[r1 * 4 + sg]));
+            }
+
+            const float k0x = (float)(int8_t)(k0 & 0xFFu), k0y = (float)(int8_t)((k0 >> 8) & 0xFFu);
+            const float k0z = (float)(int8_t)((k0 >> 16) & 0xFFu), k0w = (float)(int8_t)((k0 >> 24) & 0xFFu);
+            const float k1x = (float)(int8_t)(k1 & 0xFFu), k1y = (float)(int8_t)((k1 >> 8) & 0xFFu);
+            const float k1z = (float)(int8_t)((k1 >> 16) & 0xFFu), k1w = (float)(int8_t)((k1 >> 24) & 0xFFu);
+
+            float part0[G], part1[G];
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float4 qv = S.loop.sq[h][lane];
+                part0[h] = (k0x * qv.x + k0y * qv.y + k0z * qv.z + k0w * qv.w) * ks0;
+                part1[h] = (k1x * qv.x + k1y * qv.y + k1z * qv.z + k1w * qv.w) * ks1;
+            }
+
+            const bool hi32 = (lane & 32) != 0;
+            float r32[G];
+#pragma unroll
+            for (int h = 0; h < G; ++h)
+                r32[h] = (hi32 ? part1[h] : part0[h]) + __shfl_xor(hi32 ? part0[h] : part1[h], 32, 64);
+            const bool hi8 = (lane & 8) != 0;
+            float r8[8];
+#pragma unroll
+            for (int h = 0; h < 8; ++h) {
+                const float hi_v = (h < 4) ? r32[h + 8] : 0.0f;
+                r8[h] = (hi8 ? hi_v : r32[h]) + __shfl_xor(hi8 ? r32[h] : hi_v, 8, 64);
+            }
+            const bool hi4 = (lane & 4) != 0;
+            float r4[4];
+#pragma unroll
+            for (int h = 0; h < 4; ++h)
+                r4[h] = (hi4 ? r8[h + 4] : r8[h]) + __shfl_xor(hi4 ? r8[h] : r8[h + 4], 4, 64);
+            const bool hi2 = (lane & 2) != 0;
+            float r2a[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+                r2a[h] = (hi2 ? r4[h + 2] : r4[h]) + gfx906_dpp_xor<2>(hi2 ? r4[h] : r4[h + 2]);
+            const bool hi1 = (lane & 1) != 0;
+            float score = (hi1 ? r2a[1] : r2a[0]) + gfx906_dpp_xor<1>(hi1 ? r2a[0] : r2a[1]);
+            score += __shfl_xor(score, 16, 64);
+
+            const long long rc = c_lane == 0 ? r0 : r1;
+            const bool valid = (rc >= 0) && (h_lane < G);
+            const float s_scaled = valid ? (score * scale_log2) : -1e30f;
+            const float s_mx = fmaxf(s_scaled, __shfl_xor(s_scaled, 32, 64));
+            const float m_new = fmaxf(m_cur, s_mx);
+            const float p_val = (valid && m_new > -1e29f) ? exp2f(s_scaled - m_new) : 0.0f;
+            const float l_blk = p_val + __shfl_xor(p_val, 32, 64);
+            const float rescale = (m_cur > -1e29f) ? exp2f(m_cur - m_new) : 0.0f;
+            if (h_lane < G) {
+                m_cur = m_new;
+                l_cur = l_cur * rescale + l_blk;
+            }
+
+            const float4 vf0 = make_float4((float)(int8_t)(v0 & 0xFFu) * vs0, (float)(int8_t)((v0 >> 8) & 0xFFu) * vs0,
+                                           (float)(int8_t)((v0 >> 16) & 0xFFu) * vs0, (float)(int8_t)((v0 >> 24) & 0xFFu) * vs0);
+            const float4 vf1 = make_float4((float)(int8_t)(v1 & 0xFFu) * vs1, (float)(int8_t)((v1 >> 8) & 0xFFu) * vs1,
+                                           (float)(int8_t)((v1 >> 16) & 0xFFu) * vs1, (float)(int8_t)((v1 >> 24) & 0xFFu) * vs1);
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float rs = __shfl(rescale, h, 64);
+                const float p0 = __shfl(p_val, h, 64);
+                const float p1 = __shfl(p_val, 32 + h, 64);
+                acc[h].x = fmaf(p1, vf1.x, fmaf(p0, vf0.x, acc[h].x * rs));
+                acc[h].y = fmaf(p1, vf1.y, fmaf(p0, vf0.y, acc[h].y * rs));
+                acc[h].z = fmaf(p1, vf1.z, fmaf(p0, vf0.z, acc[h].z * rs));
+                acc[h].w = fmaf(p1, vf1.w, fmaf(p0, vf0.w, acc[h].w * rs));
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane < G) {
+        S.merge.sm[warp][lane] = m_cur;
+        S.merge.sl[warp][lane] = l_cur;
+    }
+    __syncthreads();
+
+    float M_tot[G], invL[G];
+    if (warp == 0) {
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            float mx = fmaxf(fmaxf(S.merge.sm[0][h], S.merge.sm[1][h]), fmaxf(S.merge.sm[2][h], S.merge.sm[3][h]));
+            M_tot[h] = mx;
+            float lt = 0.0f;
+            if (mx > -1e29f) {
+                for (int w = 0; w < 4; ++w)
+                    lt += (S.merge.sm[w][h] > -1e29f) ? (S.merge.sl[w][h] * exp2f(S.merge.sm[w][h] - mx)) : 0.0f;
+            }
+            invL[h] = (lt > 0.0f) ? (1.0f / lt) : 0.0f;
+        }
+    }
+    const size_t n_head_tot = (size_t) n_kv_heads * G;
+    float* out_base = attn ? (attn + ((size_t) (q_idx * n_kv_heads + kvh) * G) * HD + 4 * lane) : nullptr;
+    for (int h0 = 0; h0 < G; h0 += 3) {
+        S.merge.sacc[warp][0][lane] = acc[h0 + 0];
+        S.merge.sacc[warp][1][lane] = acc[h0 + 1];
+        S.merge.sacc[warp][2][lane] = acc[h0 + 2];
+        __syncthreads();
+        if (warp == 0) {
+#pragma unroll
+            for (int dh = 0; dh < 3; ++dh) {
+                const int h = h0 + dh;
+                const float mx = M_tot[h], il = invL[h];
+                float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                if (il > 0.0f) {
+#pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        const float ws = (S.merge.sm[w][h] > -1e29f) ? exp2f(S.merge.sm[w][h] - mx) * il : 0.0f;
+                        const float4 v = S.merge.sacc[w][dh][lane];
+                        sum.x += ws * v.x; sum.y += ws * v.y; sum.z += ws * v.z; sum.w += ws * v.w;
+                    }
+                }
+                if constexpr (GATE) {
+                    const size_t gh = (size_t) kvh * G + (size_t) h;
+                    const float4 gv = *reinterpret_cast<const float4*>(qf + (size_t) q_idx * n_head_tot * 2 * HD + (gh * 2 + 1) * HD + 4 * lane);
+                    const __half h0_v = __float2half_rn(sum.x * (1.0f / (1.0f + expf(-gv.x))));
+                    const __half h1_v = __float2half_rn(sum.y * (1.0f / (1.0f + expf(-gv.y))));
+                    const __half h2_v = __float2half_rn(sum.z * (1.0f / (1.0f + expf(-gv.z))));
+                    const __half h3_v = __float2half_rn(sum.w * (1.0f / (1.0f + expf(-gv.w))));
+                    uint16_t* dst = o16 + (size_t) q_idx * ld16 + gh * HD + 4 * lane;
+                    if (((uintptr_t) dst & 7) == 0) {
+                        const __half2 p0 = __halves2half2(h0_v, h1_v);
+                        const __half2 p1 = __halves2half2(h2_v, h3_v);
+                        *reinterpret_cast<uint2*>(dst) = make_uint2(*reinterpret_cast<const uint32_t*>(&p0),
+                                                                    *reinterpret_cast<const uint32_t*>(&p1));
+                    } else {
+                        dst[0] = __half_as_ushort(h0_v); dst[1] = __half_as_ushort(h1_v);
+                        dst[2] = __half_as_ushort(h2_v); dst[3] = __half_as_ushort(h3_v);
+                    }
+                } else {
+                    *reinterpret_cast<float4*>(out_base + (size_t) h * HD) = sum;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+static bool launch_flash_gfx906(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st,
+                                const float* qf = nullptr, uint16_t* o16 = nullptr, int64_t ld16 = 0) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_QSA_FLASH_906");
+        return v == nullptr || v[0] != '0';
+    }();
+    static const int min_q = [] {
+        const char* v = std::getenv("STRATA_QSA_FLASH_906_MIN_Q");
+        return v ? std::atoi(v) : 32;
+    }();
+    if (!enabled || n_q < min_q) return false;
+    if (pools.k_q == nullptr || pools.v_q == nullptr || pools.k_scale == nullptr || pools.v_scale == nullptr ||
+        pools.k_q4 != nullptr || pools.v_q4 != nullptr || s.head_dim != HD ||
+        s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
+        return false;
+    const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
+    const dim3 grid((unsigned) n_q, (unsigned) s.n_head_kv);
+    if (qf != nullptr) {
+        if (o16 == nullptr || ld16 < s.n_head) return false;
+        qsa_flash_gfx906_kernel<true><<<grid, 256, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                           scale_log2, nullptr, (int) cap, qf, o16, ld16);
+    } else {
+        qsa_flash_gfx906_kernel<false><<<grid, 256, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                            scale_log2, attn, (int) cap, nullptr, nullptr, 0);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+#endif
+
 bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                                  int64_t cap, const QsaShapes& s, const float* qf, uint16_t* o16, int64_t ld16, int64_t n_q,
                                  void* stream) {
-#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906)
+    if (n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
+    return launch_flash_gfx906(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
+#elif defined(__HIPCC__)
     if (n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
@@ -2476,7 +2742,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         // keeps the old kernel.
         // #371: the compute capability with its minor - sm_70 (V100) has no m16n8k8 (the kernels trap below sm_75)
 #if defined(STRATA_HIP_GFX906)
-        return false;   // gfx906: the tensor-core and WMMA kernels are not for it; the FP32 kernel runs
+        return launch_flash_gfx906(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
 #endif
         static int cc[64] = {};
         int dev = 0;

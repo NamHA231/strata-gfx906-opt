@@ -22,7 +22,7 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
 bool native_moe_combine_hits_supported(const float* parts, const float* shared, const float* output, int64_t n_embd, int64_t k, int n_tok);
 void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
                                          const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
-                                         int n_tok, void* stream);
+                                         int n_tok, void* stream, const float* shared_gate = nullptr);
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
                               int64_t n_embd, int64_t k, int n_tok, void* stream);
 /// STRATA_VERIFY_RESIDENT: the same, reading every part as `0.0f + hit[i]` - bitwise what a zeroed part row plus

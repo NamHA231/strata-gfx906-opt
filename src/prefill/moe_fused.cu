@@ -393,7 +393,7 @@ expert_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, c
 // No LDS staging: a wave reads its weight rows (16 B per row and 64-weight block) and its tile rows' activation
 // blocks (80 B) straight from global memory (L2: an expert's rows are read by every tile, a token's by every weight
 // block), one block ahead in registers; the work item's weight scales go to LDS once.
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx906__)
 #define STRATA_FUSED_W11 1
 #else
 #define STRATA_FUSED_W11 0
@@ -404,7 +404,24 @@ constexpr int W_ROWS = 128;                       // weight rows per work item (
 constexpr int W_THREADS = 256;                    // 8 waves: 4 along the weight rows (32 each) x 2 along the tile (32)
 
 __device__ __forceinline__ w11_i8 wmma_iu8(w11_i4 a, w11_i4 b, w11_i8 c) {
-#if STRATA_FUSED_W11
+#if defined(__gfx906__)
+    const int hi = (threadIdx.x >> 4) & 1;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int src = 2 * i + hi;
+        const int a0 = __shfl_sync(0xffffffffu, a[0], src);
+        const int a1 = __shfl_sync(0xffffffffu, a[1], src);
+        const int a2 = __shfl_sync(0xffffffffu, a[2], src);
+        const int a3 = __shfl_sync(0xffffffffu, a[3], src);
+        int acc = c[i];
+        acc = __builtin_amdgcn_sdot4(a0, b[0], acc, false);
+        acc = __builtin_amdgcn_sdot4(a1, b[1], acc, false);
+        acc = __builtin_amdgcn_sdot4(a2, b[2], acc, false);
+        acc = __builtin_amdgcn_sdot4(a3, b[3], acc, false);
+        c[i] = acc;
+    }
+    return c;
+#elif STRATA_FUSED_W11
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, true, b, c, false);
 #else
     __builtin_trap();
@@ -622,8 +639,12 @@ const DevInfo& dev_info() {
     if (d.done) return d;
     d.done = true;
 #if defined(STRATA_HIP_GFX906)
-    // gfx906 reports compute capability 9.0 through HIP, but the mma.sync bodies above are CUDA sm_80+ only and
-    // empty in a hipcc build: never available here (the prompt path keeps its own expert GEMMs)
+    cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_gu, expert_w11_kernel<true>, W_THREADS, 0) != hipSuccess ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_d, expert_w11_kernel<false>, W_THREADS, 0) != hipSuccess)
+        d.occ_gu = d.occ_d = 0;
+    d.cc = d.occ_gu >= 1 && d.occ_d >= 1 ? 80 : 0;
+    cudaGetLastError();
     return d;
 #elif defined(__HIPCC__)
     {   // gfx11 (RDNA3 / RDNA3.5) with this build's code for it: the WMMA kernels

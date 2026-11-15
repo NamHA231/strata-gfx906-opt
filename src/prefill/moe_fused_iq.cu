@@ -1216,7 +1216,12 @@ native_ws_kernel(const WideBatch b, const NativeGeom geo, const Tables tb, const
 #else
 #define STRATA_NAT_W12 0
 #endif
-#define STRATA_NAT_WMMA (STRATA_NAT_W11 || STRATA_NAT_W12)
+#if defined(__gfx906__)
+#define STRATA_NAT_W906 1
+#else
+#define STRATA_NAT_W906 0
+#endif
+#define STRATA_NAT_WMMA (STRATA_NAT_W11 || STRATA_NAT_W12 || STRATA_NAT_W906)
 #if STRATA_NAT_W12
 #define NW_DROW(i, hi) (8 * (hi) + (i))
 #else
@@ -1239,7 +1244,10 @@ constexpr int NW_LB = STRATA_W_LB;
 constexpr int NW_LB = 8;
 #endif
 constexpr bool nw_capped(int wt) {
-#if defined(STRATA_W_LB) || !defined(__clang_major__) || __clang_major__ < 22
+#if defined(__gfx906__)
+    (void) wt;
+    return false;
+#elif defined(STRATA_W_LB) || !defined(__clang_major__) || __clang_major__ < 22
     (void) wt;
     return true;
 #elif defined(__gfx1151__) && (__clang_major__ == 23 || (__clang_major__ >= 24 && !defined(STRATA_W_NOCAP24)))
@@ -1278,11 +1286,36 @@ __device__ __forceinline__ void nw_barrier() {
     __syncthreads();
 #endif
 }
+__device__ __forceinline__ int nw_sdot16(nw_ab a, nw_ab b, int c) {
+#if STRATA_NAT_W906
+    c = __builtin_amdgcn_sdot4(a[0], b[0], c, false);
+    c = __builtin_amdgcn_sdot4(a[1], b[1], c, false);
+    c = __builtin_amdgcn_sdot4(a[2], b[2], c, false);
+    c = __builtin_amdgcn_sdot4(a[3], b[3], c, false);
+    return c;
+#else
+    (void) a; (void) b; return c;
+#endif
+}
 __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 #if STRATA_NAT_W11
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
 #elif STRATA_NAT_W12
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#elif STRATA_NAT_W906
+    const int hi = (threadIdx.x >> 4) & 1;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int src = 2 * i + hi;
+        const nw_ab ai = nw_ab{
+            __shfl_sync(0xffffffffu, a[0], src),
+            __shfl_sync(0xffffffffu, a[1], src),
+            __shfl_sync(0xffffffffu, a[2], src),
+            __shfl_sync(0xffffffffu, a[3], src),
+        };
+        c[i] = nw_sdot16(ai, b, c[i]);
+    }
+    return c;
 #else
     __builtin_trap();
     return c;
@@ -1406,6 +1439,47 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         const int rb = 32 * wm + 16 * mt;
+#if STRATA_NAT_W906
+                        const float dx0 = h ? bx[0].y : bx[0].x;
+                        const float dx1 = h ? bx[1].y : bx[1].x;
+                        const float bs0 = h ? bsum[0].y : bsum[0].x;
+                        const float bs1 = h ? bsum[1].y : bsum[1].x;
+                        const nw_ab B0_0 = nw_v(bq[0][2 * h]), B0_1 = nw_v(bq[0][2 * h + 1]);
+                        const nw_ab B1_0 = nw_v(bq[1][2 * h]), B1_1 = nw_v(bq[1][2 * h + 1]);
+#pragma unroll
+                        for (int i0 = 0; i0 < 8; i0 += 4) {
+                            nw_ab A0[4], A1[4];
+                            float w0[4], w1[4];
+#pragma unroll
+                            for (int di = 0; di < 4; ++di) {
+                                const int r = rb + NW_DROW(i0 + di, hi);
+                                const uint4* ap = reinterpret_cast<const uint4*>(&wt[bf][r][32 * h]);
+                                A0[di] = nw_v(ap[0]);
+                                A1[di] = nw_v(ap[1]);
+                                const float2 sw = *reinterpret_cast<const float2*>(&ws[bf][r][2 * h]);
+                                w0[di] = sw.x; w1[di] = sw.y;
+                            }
+#pragma unroll
+                            for (int di = 0; di < 4; ++di) {
+                                const int i = i0 + di;
+                                if constexpr (K16) {
+                                    const int d0_0 = nw_sdot16(A0[di], B0_0, MAGIC), d0_1 = nw_sdot16(A1[di], B0_1, MAGIC);
+                                    const float v0 = fmaf(w1[di], dotf(d0_1), w0[di] * dotf(d0_0));
+                                    acc[mt][0][i] = fmaf(dx0, v0, acc[mt][0][i]);
+                                    const int d1_0 = nw_sdot16(A0[di], B1_0, MAGIC), d1_1 = nw_sdot16(A1[di], B1_1, MAGIC);
+                                    const float v1 = fmaf(w1[di], dotf(d1_1), w0[di] * dotf(d1_0));
+                                    acc[mt][1][i] = fmaf(dx1, v1, acc[mt][1][i]);
+                                } else {
+                                    const int d0 = nw_sdot16(A1[di], B0_1, nw_sdot16(A0[di], B0_0, MAGIC));
+                                    acc[mt][0][i] = fmaf(w0[di] * dx0, dotf(d0), acc[mt][0][i]);
+                                    if constexpr (has_min(WT)) acc[mt][0][i] = fmaf(w1[di] * dx0, bs0, acc[mt][0][i]);
+                                    const int d1 = nw_sdot16(A1[di], B1_1, nw_sdot16(A0[di], B1_0, MAGIC));
+                                    acc[mt][1][i] = fmaf(w0[di] * dx1, dotf(d1), acc[mt][1][i]);
+                                    if constexpr (has_min(WT)) acc[mt][1][i] = fmaf(w1[di] * dx1, bs1, acc[mt][1][i]);
+                                }
+                            }
+                        }
+#else
 #if STRATA_NAT_W12
                         // k 32 h + 8 hi .. + 7 (A0) and 32 h + 16 + 8 hi .. + 7 (A1) of row rb + l16
                         const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
@@ -1441,6 +1515,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                                 }
                             }
                         }
+#endif
                     }
                 }
             }
@@ -1777,9 +1852,16 @@ const DevInfo& dev_info() {
     if (d.done) return d;
     d.done = true;
 #if defined(STRATA_HIP_GFX906)
-    // gfx906 reports compute capability 9.0 through HIP, but the mma.sync bodies above are CUDA sm_80+ only and
-    // empty in a hipcc build: never available here (the prompt path keeps its own expert GEMMs)
-    return d;
+    {
+        cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
+        int o = 0;
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&o, native_w11_kernel<T_IQ2_S, true>, NW_THREADS, 0) != hipSuccess)
+            o = 0;
+        d.ok = o >= 1;
+        d.occ = d.ok ? o : 1;
+        cudaGetLastError();
+        return d;
+    }
 #elif defined(__HIPCC__)
     {   // gfx11 / gfx12 with this build's code: the WMMA kernels (one occupancy for all: the same shape and LDS budget)
         cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
@@ -1876,7 +1958,11 @@ bool gu_covered(int t) {
            || (t == T_Q2_0 && (dev_info().t75 || dev_info().q2n))   // Q2_0 gate/up: the Turing opt-in, or STRATA_PF_FUSED_Q2N=1 on sm_80+
 #endif
 #if defined(__HIPCC__)
-           || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
+           || (t == T_Q2_0 && (dev_info().w12
+#if defined(STRATA_HIP_GFX906)
+                               || true
+#endif
+                               ))   // gfx12 / gfx906: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
 #endif
         ;
