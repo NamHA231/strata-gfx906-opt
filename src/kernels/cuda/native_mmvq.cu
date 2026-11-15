@@ -2365,6 +2365,9 @@ void launch_check() {
 // 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
+// gfx906 experiment: two adjacent Q8_0 output rows per wavefront. Default stays one row.
+bool g_wave_two_rows = std::getenv("STRATA_GFX906_MMVQ_ROWS") &&
+                       std::string(std::getenv("STRATA_GFX906_MMVQ_ROWS")) == "2";
 template<typename F, int NCOLS, int R, bool PAIR = false>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
@@ -2418,18 +2421,30 @@ template<typename F, int NCOLS>
 void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    constexpr int R = 1;
-    const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
-    native_mmvq_wave_kernel<F, NCOLS, R, false><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+    if constexpr (std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        if (g_wave_two_rows) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + 7) / 8);
+            native_mmvq_wave_kernel<F, NCOLS, 2, false><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+            return;
+        }
+    }
+    const unsigned blocks = unsigned((std::size_t(n_out) + 3) / 4);
+    native_mmvq_wave_kernel<F, NCOLS, 1, false><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
 }
 template<typename F, int NCOLS>
 void wave_launch_pair_n(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out, cudaStream_t s) {
     const auto* a = static_cast<const typename F::Block*>(w1);
     const auto* b = static_cast<const typename F::Block*>(w2);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    constexpr int R = 1;
-    const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
-    native_mmvq_wave_kernel<F, NCOLS, R, true><<<blocks, 256, 0, s>>>(a, x, y1, n_in, n_out, b, y2);
+    if constexpr (std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        if (g_wave_two_rows) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + 7) / 8);
+            native_mmvq_wave_kernel<F, NCOLS, 2, true><<<blocks, 256, 0, s>>>(a, x, y1, n_in, n_out, b, y2);
+            return;
+        }
+    }
+    const unsigned blocks = unsigned((std::size_t(n_out) + 3) / 4);
+    native_mmvq_wave_kernel<F, NCOLS, 1, true><<<blocks, 256, 0, s>>>(a, x, y1, n_in, n_out, b, y2);
 }
 template<typename F>
 void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -3243,6 +3258,14 @@ bool q2_0_warp_rows_on() {
     return on[dev] > 0;
 }
 }  // namespace
+
+void native_mmvq_set_gfx906_wave_rows(int rows) {
+#if defined(STRATA_HIP_GFX906)
+    g_wave_two_rows = rows == 2;
+#else
+    (void) rows;
+#endif
+}
 
 void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {

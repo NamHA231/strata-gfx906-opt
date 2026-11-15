@@ -2323,6 +2323,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
 #pragma unroll
     for (int k = 0; k < 10; ++k) {
         const int64_t r = slot[t * 10 + k];
+        if (r < 0) continue;
         const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];   // the product scale_down_rows stored
         s = fmaf(w[t * 10 + k], v, s);
     }
@@ -2345,6 +2346,7 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     for (int k = 0; k < 10; ++k) {
         ww[k] = w[t * 10 + k];
         const int64_t r = slot[t * 10 + k];
+        if (r < 0) { v[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f); continue; }
         v[k] = *reinterpret_cast<const float4*>(Dm + r * N + d);
         if (row_sd) {   // NVFP4 in MMQ: the row's s_down, as moe_combine_kernel applies it
             const float sd = row_sd[r];

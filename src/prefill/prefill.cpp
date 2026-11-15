@@ -4200,7 +4200,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
                     // first block is complete; past the chunk's last cell nothing is read until a later append writes
                     // it).  CUDA: never.
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
                     static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
 #else
                     constexpr bool kv_host_dma = false;
@@ -4796,10 +4796,58 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             pt.mark(kPfHostGroup, cs);
                         }
                         std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                        std::vector<int32_t> min_rank;
+                        static const int pf_tail_skip = [] {
+                            const char* e = std::getenv("STRATA_PF_TAIL_SKIP");
+                            if (e != nullptr) return std::atoi(e);
+#if defined(STRATA_HIP_GFX906)
+                            return 7;
+#else
+                            return 0;
+#endif
+                        }();
+                        static const int pf_tail_max_env = [] {
+                            const char* e = std::getenv("STRATA_PF_TAIL_MAX_CNT");
+                            return e != nullptr ? std::atoi(e) : -1;
+                        }();
+                        const bool tail_skip_on = !stream_all && pf_tail_skip > 0 && pf_tail_skip < (int) K &&
+                                                  m.host_res != nullptr && m.cache != nullptr && m.pp == nullptr;
+                        if (tail_skip_on) min_rank.assign((size_t) m.g->n_expert, (int32_t) K);
                         for (int64_t i = 0; i < T * K; ++i) {
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                            if (tail_skip_on) {
+                                const int32_t rk = (int32_t) (i % K);
+                                if (rk < min_rank[(size_t) e]) min_rank[(size_t) e] = rk;
+                            }
+                        }
+                        std::vector<char> on_skip;
+                        int64_t rows_skipped = 0;
+                        if (tail_skip_on) {
+                            const int32_t max_cnt = pf_tail_max_env >= 0 ? pf_tail_max_env
+                                                                         : std::max<int32_t>(2, (int32_t) (T / 128));
+                            int64_t n_skipped_exp = 0;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                const int32_t c = m.cnt[(size_t) e];
+                                if (c <= 0 || c > max_cnt) continue;
+                                if (m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (min_rank[(size_t) e] < pf_tail_skip) continue;
+                                if (on_skip.empty()) on_skip.assign((size_t) m.g->n_expert, 0);
+                                on_skip[(size_t) e] = 1;
+                                rows_skipped += c;
+                                ++n_skipped_exp;
+                            }
+                            if (n_skipped_exp > 0) {
+                                if (static bool said_tail = false; !said_tail) {
+                                    said_tail = true;
+                                    std::fprintf(stderr, "strata prefill: FGPR tail-rank skip active (STRATA_PF_TAIL_SKIP=%d, "
+                                                         "max_cnt=%d): layer %lld skipped %lld non-resident tail stragglers "
+                                                         "(%lld/%lld rows)\n",
+                                                 pf_tail_skip, (int) max_cnt, (long long) l, (long long) n_skipped_exp,
+                                                 (long long) rows_skipped, (long long) (T * K));
+                                }
+                            }
                         }
                         // STRATA_PREFILL_ROUTED_STREAM: this layer's routing to the issuer (it drops the unrouted entries
                         // it has not issued yet; the walk below gives every unrouted entry back without reading it)
@@ -4809,7 +4857,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             int64_t nstream = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                if (c == 0 || (!on_skip.empty() && on_skip[(size_t) e]) ||
+                                    (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
                                     continue;
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
@@ -4863,10 +4912,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         {
                             int32_t r = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e])) {
+                                if ((on_skip.empty() || !on_skip[(size_t) e]) &&
+                                    (on_peer.empty() || !on_peer[(size_t) e]) &&
+                                    (on_cpu.empty() || !on_cpu[(size_t) e])) {
                                     m.off[(size_t) e] = r;
                                     r += m.cnt[(size_t) e];
                                 }
+                            rows_local = r;
+                            for (int32_t e = 0; e < m.g->n_expert && !on_skip.empty(); ++e)
+                                if (on_skip[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             // the peer's rows in order_peer's order (peer-held, then peer-streamed): its groups need them contiguous
                             for (int kind = 1; kind <= 2 && !on_peer.empty(); ++kind)
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)
@@ -4874,7 +4928,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
-                            rows_local -= rows_cpu;
+                        }
+                        if (rows_skipped > 0) {
+                            cudaMemsetAsync(m.Dm + (size_t) rows_local * N, 0, (size_t) rows_skipped * N * sizeof(float), m.cs);
+                            if (use_mmq && lay.native && lay.fmt[(size_t) l].tail_off && m.row_sd)
+                                cudaMemsetAsync(m.row_sd + rows_local, 0, (size_t) rows_skipped * sizeof(float), m.cs);
                         }
                         std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                         for (int64_t i = 0; i < T * K; ++i) {
@@ -4886,7 +4944,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
-                            if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2) &&
+                            if (m.cnt[(size_t) e] > 0 && (on_skip.empty() || !on_skip[(size_t) e]) &&
+                                (on_peer.empty() || on_peer[(size_t) e] != 2) &&
                                 (on_cpu.empty() || !on_cpu[(size_t) e]))
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
@@ -4901,7 +4960,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool sort_all = detail::mmq_resident_sort_requested();
                         const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
                                                order.size() >= (size_t) MMQ_GROUP;
-                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
+                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty() && on_skip.empty(), use_mmq, lay.native,
                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,

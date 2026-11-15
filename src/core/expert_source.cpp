@@ -3864,19 +3864,28 @@ bool FileExpertSource::pin_cache_complement(
                 std::fflush(stderr);
             }
             errno = 0;
-            if (paced) {   // page-aligned: the steps are registered on page boundaries
+            if (paced) {   // page-aligned (2 MiB when THP applies): the steps are registered on page boundaries
 #if !defined(_WIN32)
                 void* aligned = nullptr;
                 const uint64_t page = 4096;
-                if (posix_memalign(&aligned, (size_t) page, (size_t) ((bytes + page - 1) / page * page)) == 0) arena = aligned;
+                const uint64_t align = (
+#if defined(__linux__)
+                    !numa.place ? (2ull << 20) :
+#endif
+                    page);
+                const size_t alloc_bytes = (size_t) ((bytes + page - 1) / page * page);
+                if (posix_memalign(&aligned, (size_t) align, alloc_bytes) == 0) arena = aligned;
 #endif
 #if defined(__linux__)
                 // STRATA_NUMA_SPLIT: a 2 MiB huge page would put several slices on its toucher's node, so the arena
-                // takes 4 KiB pages (one call, no VMA split)
+                // takes 4 KiB pages (one call, no VMA split).  Otherwise advise MADV_HUGEPAGE before faulting pages
+                // in so KFD userptr / SDMA walks 2 MiB huge pages instead of 6.4M 4 KiB PTEs.
                 if (arena != nullptr && numa.place) {
-                    if (madvise(arena, (size_t) ((bytes + page - 1) / page * page), MADV_NOHUGEPAGE) != 0)
+                    if (madvise(arena, alloc_bytes, MADV_NOHUGEPAGE) != 0)
                         std::fprintf(stderr, "FileExpertSource: WARNING: madvise(MADV_NOHUGEPAGE) on the complement "
                                              "failed (errno %d)\n", errno);
+                } else if (arena != nullptr) {
+                    (void) madvise(arena, alloc_bytes, MADV_HUGEPAGE);
                 }
 #endif
             } else {
